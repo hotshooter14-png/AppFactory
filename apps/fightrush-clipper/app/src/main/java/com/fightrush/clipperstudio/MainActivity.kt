@@ -23,6 +23,8 @@ import androidx.media3.common.MediaItem.ClippingConfiguration
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.EditedMediaItem
+import androidx.media3.transformer.EditedMediaItemSequence
+import androidx.media3.transformer.Composition
 import androidx.media3.transformer.Transformer
 import java.io.File
 import java.util.concurrent.Executors
@@ -34,10 +36,9 @@ class MainActivity : ComponentActivity() {
     private val executor = Executors.newSingleThreadExecutor()
     private var sourceUri: Uri? = null
     private var sourceDurationMs = 0L
-    private var selectedStartMs = 0L
-    private var selectedEndMs = 0L
+    private var selectedSegments: List<Pair<Long, Long>> = emptyList()
     private var introSeconds = 35
-    private var maxSeconds = 155
+    private var maxSeconds = 150
     private var walkouts = true
     private var faceOff = true
     private lateinit var status: TextView
@@ -106,10 +107,10 @@ class MainActivity : ComponentActivity() {
 
         maxLabel = label("MAX OUTPUT LENGTH  •  $maxSeconds seconds", 14, "#FFFFFF", true)
         root.addView(maxLabel)
-        val maxSeek = SeekBar(this).apply { max = 155; progress = 155 }
+        val maxSeek = SeekBar(this).apply { max = 150; progress = 150 }
         maxSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, value: Int, fromUser: Boolean) {
-                maxSeconds = max(15, value)
+                maxSeconds = max(30, value)
                 maxLabel.text = "MAX OUTPUT LENGTH  •  $maxSeconds seconds"
             }
             override fun onStartTrackingTouch(seekBar: SeekBar?) {}
@@ -197,23 +198,32 @@ class MainActivity : ComponentActivity() {
                     runOnUiThread { progress.progress = pct }
                 }
                 if (scores.isEmpty()) throw IllegalStateException("No readable video frames were found.")
-                val target = min(maxSeconds, 45)
-                val targetSamples = max(1, target / sampleStep)
-                var bestIndex = 0
-                var bestScore = -1.0
+                val ranked = ArrayList<Triple<Int, Int, Double>>()
+                val windowSec = 10
                 for (i in scores.indices) {
-                    val end = min(scores.size, i + targetSamples)
-                    var total = 0.0
-                    for (j in i until end) total += scores[j].second
-                    val average = total / max(1, end - i)
-                    if (average > bestScore) { bestScore = average; bestIndex = i }
+                    val start = scores[i].first
+                    val end = min(durationSec, start + windowSec)
+                    if (end - start < 5) continue
+                    val values = scores.filter { it.first >= start && it.first < end }
+                    if (values.isNotEmpty()) ranked.add(Triple(start, end, values.map { it.second }.average()))
                 }
-                selectedStartMs = max(0L, scores[bestIndex].first.toLong() * 1000L)
-                val clipSeconds = min(target, max(1, durationSec - selectedStartMs / 1000L).toInt())
-                selectedEndMs = min(sourceDurationMs, selectedStartMs + clipSeconds * 1000L)
+                ranked.sortByDescending { it.third }
+                val chosen = ArrayList<Pair<Long, Long>>()
+                var total = 0
+                for (c in ranked) {
+                    val start = c.first
+                    val end = min(c.second, start + windowSec)
+                    if (end <= start || total + end - start > maxSeconds) continue
+                    if (chosen.any { start < it.second / 1000L + 3 && end > it.first / 1000L - 3 }) continue
+                    chosen.add(Pair(start * 1000L, end * 1000L))
+                    total += end - start
+                    if (total >= maxSeconds) break
+                }
+                selectedSegments = chosen.sortedBy { it.first }
+                if (selectedSegments.isEmpty()) throw IllegalStateException("No highlight windows selected.")
                 runOnUiThread {
                     progress.progress = 100
-                    status.text = "Scan complete. Best motion window: ${selectedStartMs / 1000}s–${selectedEndMs / 1000}s. Export to create the MP4."
+                    status.text = "Scan complete: ${selectedSegments.size} separate action windows, ${total}s total. Export to join them."
                     exportButton.isEnabled = true
                     scanButton.isEnabled = true
                 }
@@ -230,20 +240,20 @@ class MainActivity : ComponentActivity() {
 
     private fun exportHighlight() {
         val uri = sourceUri ?: return
-        if (selectedEndMs <= selectedStartMs) {
+        if (selectedSegments.isEmpty()) {
             Toast.makeText(this, "Scan a video first.", Toast.LENGTH_SHORT).show()
             return
         }
         val dir = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "FightRush")
         if (!dir.exists()) dir.mkdirs()
         val output = File(dir, "FightRush_${System.currentTimeMillis()}.mp4")
-        val clip = MediaItem.Builder().setUri(uri).setClippingConfiguration(
-            ClippingConfiguration.Builder()
-                .setStartPositionMs(selectedStartMs)
-                .setEndPositionMs(selectedEndMs)
-                .build()
-        ).build()
-        val edited = EditedMediaItem.Builder(clip).build()
+        val editedItems = selectedSegments.map { segment ->
+            val clip = MediaItem.Builder().setUri(uri).setClippingConfiguration(
+                ClippingConfiguration.Builder().setStartPositionMs(segment.first).setEndPositionMs(segment.second).build()
+            ).build()
+            EditedMediaItem.Builder(clip).build()
+        }
+        val composition = Composition.Builder(EditedMediaItemSequence.Builder(editedItems).build()).build()
         progress.visibility = View.VISIBLE
         progress.progress = 0
         status.text = "Exporting MP4… keep FightRush open until finished."
@@ -287,7 +297,7 @@ class MainActivity : ComponentActivity() {
                     exportButton.isEnabled = true
                 }
             }
-        }).build().start(edited, output.absolutePath)
+        }).build().start(composition, output.absolutePath)
     }
 
     private fun label(text: String, size: Int, color: String, bold: Boolean): TextView =
