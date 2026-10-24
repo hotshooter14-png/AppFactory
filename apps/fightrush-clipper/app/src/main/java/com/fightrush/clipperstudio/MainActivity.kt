@@ -1,6 +1,8 @@
 package com.fightrush.clipperstudio
 
 import android.graphics.Bitmap
+import android.content.ContentValues
+import android.provider.MediaStore
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Bundle
@@ -149,7 +151,7 @@ class MainActivity : ComponentActivity() {
         exportButton.setOnClickListener { exportHighlight() }
         root.addView(exportButton)
         root.addView(space(14))
-        root.addView(label("Output folder: Movies/FightRush (app-specific storage)", 12, "#8F939D", false))
+        root.addView(label("Output folder: Gallery / Movies / FightRush", 12, "#8F939D", false))
     }
 
     private fun scanVideo() {
@@ -250,9 +252,33 @@ class MainActivity : ComponentActivity() {
             override fun onCompleted(composition: androidx.media3.transformer.Composition, exportResult: ExportResult) {
                 runOnUiThread {
                     progress.progress = 100
-                    status.text = "Export complete: ${output.name}\nSaved in app Movies/FightRush folder."
+                    try {
+                        val values = ContentValues().apply {
+                            put(MediaStore.Video.Media.DISPLAY_NAME, output.name)
+                            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                            put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/FightRush")
+                            put(MediaStore.Video.Media.IS_PENDING, 1)
+                        }
+                        val savedUri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+                            ?: throw IllegalStateException("Could not create a gallery video entry.")
+                        try {
+                            contentResolver.openOutputStream(savedUri, "w")?.use { destination ->
+                                output.inputStream().use { source -> source.copyTo(destination) }
+                            } ?: throw IllegalStateException("Could not open gallery output stream.")
+                            val done = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
+                            contentResolver.update(savedUri, done, null, null)
+                            output.delete()
+                            status.text = "Export complete: ${output.name}\nSaved to Gallery / Movies / FightRush."
+                            Toast.makeText(this@MainActivity, "Highlight saved to Gallery: Movies/FightRush", Toast.LENGTH_LONG).show()
+                        } catch (copyError: Exception) {
+                            contentResolver.delete(savedUri, null, null)
+                            throw copyError
+                        }
+                    } catch (saveError: Exception) {
+                        status.text = "Exported, but gallery save failed: ${saveError.message ?: "unknown error"}."
+                        Toast.makeText(this@MainActivity, "Could not save to gallery. Check storage space.", Toast.LENGTH_LONG).show()
+                    }
                     exportButton.isEnabled = true
-                    Toast.makeText(this@MainActivity, "Highlight exported.", Toast.LENGTH_LONG).show()
                 }
             }
             override fun onError(composition: androidx.media3.transformer.Composition, exportResult: ExportResult, exportException: ExportException) {
